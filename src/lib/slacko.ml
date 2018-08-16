@@ -627,7 +627,11 @@ type api_answer = {
 let validate json =
   match api_answer_of_yojson json with
   | Result.Error str -> `ParseFailure str
-  | Result.Ok parsed -> match parsed.ok, parsed.error with
+  | Result.Ok parsed ->
+    (match parsed.error with
+    | Some err -> prerr_endline err
+    | None -> ());
+    match parsed.ok, parsed.error with
     | true, _ -> `Json_response json
     | _, Some "account_inactive" -> `Account_inactive
     | _, Some "already_archived" -> `Already_archived
@@ -695,9 +699,8 @@ let filter_useless = function
   | otherwise -> otherwise
 
 let process request =
-  request
-  >|= snd
-  >>= Cohttp_body.to_string
+  request >>= fun (_status, body) ->
+  Cohttp_lwt.Body.to_string body
   >|= Yojson.Safe.from_string
   >|= validate
   >|= filter_useless
@@ -720,10 +723,15 @@ let maybe fn = function
   | Some v -> Some (fn v)
   | None -> None
 
+type cursor_obj = {
+  next_cursor: string
+} [@@deriving of_yojson]
+
 (* nonpublic types for conversion in list types *)
 type channels_list_obj = {
-  channels: channel_obj list
-} [@@deriving of_yojson]
+  channels: channel_obj list;
+  response_metadata: cursor_obj option;
+} [@@deriving of_yojson { strict = false }]
 
 type users_list_obj = {
   members: user_obj list
@@ -738,16 +746,23 @@ type im_list_obj = {
 } [@@deriving of_yojson]
 
 let channels_list ?exclude_archived session =
+  let rec loop ?cursor all =
   endpoint "channels.list" session
     |> optionally_add "exclude_archived" @@ maybe string_of_bool @@ exclude_archived
+    |> optionally_add "cursor" @@ maybe (fun x -> x) cursor
     |> query
-    >|= function
+    >>= function
     | `Json_response d ->
       (match d |> channels_list_obj_of_yojson with
-        | Result.Ok x -> `Success x.channels
-        | Result.Error x -> `ParseFailure x)
-    | #parsed_auth_error as res -> res
-    | _ -> `Unknown_error
+        | Result.Ok x ->
+          (match x.response_metadata with
+          | Some { next_cursor } ->
+            loop ~cursor:next_cursor (List.rev_append x.channels all)
+          | None -> Lwt.return (`Success all))
+        | Result.Error x -> Lwt.return (`ParseFailure x))
+    | #parsed_auth_error as res -> Lwt.return res
+    | _ -> Lwt.return `Unknown_error
+  in loop []
 
 let users_list session =
   endpoint "users.list" session
@@ -784,7 +799,7 @@ let id_of_channel session = function
   | ChannelId id -> Lwt.return @@ `Found id
   | ChannelName name ->
     let base = String.sub name 1 @@ String.length name - 1 in
-    lookupk session channels_list (fun (x:channel_obj) -> x.name = base) @@ function
+    lookupk session (channels_list ~exclude_archived:true) (fun (x:channel_obj) -> x.name = base) @@ function
     | [] -> `Channel_not_found
     | [{id = ChannelId s; _}] -> `Found s
     | [_] -> failwith "Bad result from channel id lookup."
